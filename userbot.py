@@ -115,27 +115,69 @@ def save_seen_ids(seen: Set[str]) -> None:
         logger.error("Ошибка сохранения seen_ids: %s", e)
 
 
-def send_to_telegram(text: str) -> bool:
+def send_to_telegram(
+    text: str,
+    photo_url: Optional[str] = None,
+    document_bytes: Optional[bytes] = None,
+    document_name: Optional[str] = None
+) -> bool:
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         logger.warning("Не настроен TG_BOT_TOKEN или TG_CHAT_ID! Перейдите в Telegram и укажите ID группы в .env")
         return False
 
     try:
-        payload = {
-            "chat_id": TG_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }
-        r = requests.post(f"{TG_API_BASE}/sendMessage", json=payload, timeout=12)
-        res = r.json()
-        if r.status_code == 200 and res.get("ok"):
-            return True
+        if document_bytes:
+            filename = document_name or "document"
+            payload = {
+                "chat_id": TG_CHAT_ID,
+                "caption": text[:1024],
+                "parse_mode": "HTML"
+            }
+            files = {
+                "document": (filename, document_bytes)
+            }
+            r = requests.post(f"{TG_API_BASE}/sendDocument", data=payload, files=files, timeout=30)
+            res = r.json()
+            if r.status_code == 200 and res.get("ok"):
+                return True
+            else:
+                logger.warning("Не удалось отправить документ с HTML: %s, повтор plain text", res.get("description"))
+                payload["parse_mode"] = ""
+                r2 = requests.post(f"{TG_API_BASE}/sendDocument", data=payload, files={"document": (filename, document_bytes)}, timeout=30)
+                return bool(r2.status_code == 200 and r2.json().get("ok"))
+
+        elif photo_url:
+            payload = {
+                "chat_id": TG_CHAT_ID,
+                "photo": photo_url,
+                "caption": text[:1024],
+                "parse_mode": "HTML"
+            }
+            r = requests.post(f"{TG_API_BASE}/sendPhoto", json=payload, timeout=20)
+            res = r.json()
+            if r.status_code == 200 and res.get("ok"):
+                return True
+            else:
+                logger.warning("Не удалось отправить фото с HTML: %s, повтор plain text", res.get("description"))
+                payload["parse_mode"] = ""
+                r2 = requests.post(f"{TG_API_BASE}/sendPhoto", json=payload, timeout=20)
+                return bool(r2.status_code == 200 and r2.json().get("ok"))
+
         else:
-            logger.error("Ошибка Telegram API: %s", res.get("description"))
-            # Попытка без HTML форматирования
-            requests.post(f"{TG_API_BASE}/sendMessage", json={"chat_id": TG_CHAT_ID, "text": text}, timeout=10)
-            return False
+            payload = {
+                "chat_id": TG_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            }
+            r = requests.post(f"{TG_API_BASE}/sendMessage", json=payload, timeout=12)
+            res = r.json()
+            if r.status_code == 200 and res.get("ok"):
+                return True
+            else:
+                logger.error("Ошибка Telegram API: %s", res.get("description"))
+                requests.post(f"{TG_API_BASE}/sendMessage", json={"chat_id": TG_CHAT_ID, "text": text}, timeout=10)
+                return False
     except Exception as e:
         logger.error("Исключение при отправке в Telegram: %s", e)
         return False
@@ -271,7 +313,49 @@ def resolve_unknown_senders(sock: ssl.SSLSocket, sender_ids: Set[int]):
         logger.debug("Ошибка получения имен контактов: %s", e)
 
 
-def parse_and_forward_message(msg: Dict[str, Any], seen_ids: Set[str], initial_warmup: bool = False) -> None:
+def request_file_url(sock: Optional[ssl.SSLSocket], file_id: int, chat_id: int, message_id: int) -> Optional[str]:
+    """Запрашивает временную ссылку на скачивание файла через Opcode 88."""
+    if not sock:
+        return None
+    try:
+        send_frame(sock, 10, 0, get_seq(), 88, {
+            "fileId": file_id,
+            "chatId": chat_id,
+            "messageId": message_id,
+            "itemType": "REGULAR"
+        })
+        cmd, seq, op, data = recv_frame(sock, timeout=5.0)
+        if op == 88 and isinstance(data, dict):
+            return data.get("url")
+    except Exception as e:
+        logger.error("Ошибка при запросе ссылки на файл %s: %s", file_id, e)
+    return None
+
+
+def download_file_bytes(url: str, max_size: int = 45 * 1024 * 1024) -> Optional[bytes]:
+    """Скачивает файл по временной ссылке (с защитой по максимальному размеру 45MB)."""
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30, stream=True)
+        if r.status_code == 200:
+            content = bytearray()
+            for chunk in r.iter_content(chunk_size=65536):
+                content.extend(chunk)
+                if len(content) > max_size:
+                    logger.warning("Файл превышает лимит 45MB, пропуск скачивания.")
+                    return None
+            return bytes(content)
+    except Exception as e:
+        logger.error("Ошибка скачивания файла: %s", e)
+    return None
+
+
+def parse_and_forward_message(
+    sock: Optional[ssl.SSLSocket],
+    msg: Dict[str, Any],
+    target_chat_id: int,
+    seen_ids: Set[str],
+    initial_warmup: bool = False
+) -> None:
     msg_id = str(msg.get("id") or "")
     if not msg_id:
         return
@@ -289,8 +373,11 @@ def parse_and_forward_message(msg: Dict[str, Any], seen_ids: Set[str], initial_w
     attaches = msg.get("attaches") or []
 
     # Поддержка пересланных сообщений (Forward)
+    is_forward = False
     fwd_msg = (msg.get("link") or {}).get("message")
+    fwd_chat_id = (msg.get("link") or {}).get("chatId")
     if isinstance(fwd_msg, dict):
+        is_forward = True
         if not text and fwd_msg.get("text"):
             text = fwd_msg.get("text")
         if not attaches and fwd_msg.get("attaches"):
@@ -298,28 +385,82 @@ def parse_and_forward_message(msg: Dict[str, Any], seen_ids: Set[str], initial_w
         if not sender_id and fwd_msg.get("sender"):
             sender_id = fwd_msg.get("sender")
 
+    # Игнорируем сервисные события входа/выхода (CONTROL)
+    if attaches and all(a.get("_type") == "CONTROL" for a in attaches) and not text:
+        seen_ids.add(msg_id)
+        return
+
     if not text and not attaches:
         seen_ids.add(msg_id)
         return
 
-    author_name = USER_NAMES.get(sender_id) or f"Участник #{sender_id}" if sender_id else "Сообщение"
+    author_name = USER_NAMES.get(sender_id) or (f"Участник #{sender_id}" if sender_id else "Сообщение")
     safe_author = html.escape(str(author_name))
-    safe_text = html.escape(str(text)) if text else "<i>(без текста / вложение)</i>"
+    safe_text = html.escape(str(text)) if text else ""
 
-    links = []
+    header = f"💬 <b>[{SOURCE_CHAT_NAME}] {safe_author}</b>:"
+    if is_forward:
+        header += " <i>(пересланное сообщение)</i>"
+    if safe_text:
+        header += f"\n{safe_text}"
+    elif not attaches:
+        header += "\n<i>(без текста)</i>"
+
+    # Обработка медиа и вложений (фото, файлы, документы)
+    photo_url = None
+    doc_bytes = None
+    doc_name = None
+    other_links = []
+
     for att in attaches:
-        att_type = att.get("_type") or att.get("type") or "файл"
-        url = att.get("url") or (att.get("payload") or {}).get("url")
-        name = att.get("name") or att_type
-        if url:
-            links.append(f"📎 <a href=\"{url}\">{html.escape(str(name))}</a>")
+        att_type = att.get("_type") or att.get("type") or ""
 
-    header = f"💬 <b>[{SOURCE_CHAT_NAME}] {safe_author}</b>:\n{safe_text}"
-    if links:
-        header += "\n" + "\n".join(links)
+        # 1. Фотография (в MAX у фото есть baseUrl или url)
+        if (att_type == "PHOTO" or "baseUrl" in att or "photoId" in att) and not photo_url and not doc_bytes:
+            photo_url = att.get("baseUrl") or att.get("url")
 
-    logger.info("📩 Новое сообщение от %s: %s", author_name, text[:60])
-    if send_to_telegram(header):
+        # 2. Файл / Документ (например .xlsx, .pdf, .docx)
+        elif (att_type == "FILE" or "fileId" in att) and sock and not doc_bytes:
+            file_id = att.get("fileId")
+            file_name = att.get("name") or "файл"
+            if file_id:
+                # Запрашиваем прямую ссылку на скачивание у сервера MAX через Opcode 88
+                download_url = request_file_url(sock, file_id, target_chat_id, int(msg_id))
+                if not download_url and fwd_chat_id and fwd_msg and fwd_msg.get("id"):
+                    download_url = request_file_url(sock, file_id, int(fwd_chat_id), int(fwd_msg["id"]))
+
+                if download_url:
+                    logger.info("📥 Скачивание файла '%s' (ID: %s)...", file_name, file_id)
+                    b = download_file_bytes(download_url)
+                    if b:
+                        doc_bytes = b
+                        doc_name = file_name
+                    else:
+                        other_links.append(f"📎 <a href=\"{download_url}\">{html.escape(file_name)}</a>")
+                else:
+                    other_links.append(f"📎 Файл: {html.escape(file_name)} (не удалось получить ссылку)")
+
+        # 3. Другие вложения / веб-ссылки
+        else:
+            url = att.get("url") or (att.get("payload") or {}).get("url")
+            name = att.get("name") or att_type or "вложение"
+            if url:
+                other_links.append(f"📎 <a href=\"{url}\">{html.escape(str(name))}</a>")
+
+    if other_links:
+        header += "\n" + "\n".join(other_links)
+
+    logger.info("📩 Новое сообщение от %s: %s (вложений: %d)", author_name, (text[:60] if text else doc_name or "фото/файл"), len(attaches))
+
+    sent = False
+    if doc_bytes:
+        sent = send_to_telegram(header, document_bytes=doc_bytes, document_name=doc_name)
+    elif photo_url:
+        sent = send_to_telegram(header, photo_url=photo_url)
+    else:
+        sent = send_to_telegram(header)
+
+    if sent:
         seen_ids.add(msg_id)
         save_seen_ids(seen_ids)
 
@@ -425,7 +566,7 @@ def run_userbot():
                 if unknown:
                     resolve_unknown_senders(sock, unknown)
                 for m in msgs:
-                    parse_and_forward_message(m, seen_ids, initial_warmup=first_run)
+                    parse_and_forward_message(sock, m, target_chat_id, seen_ids, initial_warmup=first_run)
             first_run = False
             save_seen_ids(seen_ids)
             logger.info("👀 Мониторинг группы '%s' активен! Ожидаем новых сообщений...", SOURCE_CHAT_NAME)
@@ -466,7 +607,7 @@ def run_userbot():
                         if unknown:
                             resolve_unknown_senders(sock, unknown)
                         for m in reversed(msgs):
-                            parse_and_forward_message(m, seen_ids, initial_warmup=False)
+                            parse_and_forward_message(sock, m, target_chat_id, seen_ids, initial_warmup=False)
 
                     # 3. Серверное push-уведомление о новом сообщении в реальном времени
                     elif "message" in data:
@@ -490,7 +631,7 @@ def run_userbot():
                         sender = msg_obj.get("sender")
                         if sender and sender not in USER_NAMES:
                             resolve_unknown_senders(sock, {sender})
-                        parse_and_forward_message(msg_obj, seen_ids, initial_warmup=False)
+                        parse_and_forward_message(sock, msg_obj, target_chat_id, seen_ids, initial_warmup=False)
 
                 time.sleep(1.0)
 
