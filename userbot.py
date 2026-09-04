@@ -8,6 +8,8 @@ MAX Messenger -> Telegram Userbot (Юзербот)
 Работает 24/7 автономно на любом бот-хостинге или сервере без открытого браузера.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import json
@@ -20,7 +22,7 @@ import socket
 import logging
 import threading
 from pathlib import Path
-from typing import Optional, Dict, Any, Set
+from typing import Optional, Dict, Any, Set, List, Tuple
 
 import requests
 import msgpack
