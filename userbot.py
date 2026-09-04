@@ -162,7 +162,7 @@ def recv_exact(sock: ssl.SSLSocket, n: int) -> bytes:
 def recv_frame(sock: ssl.SSLSocket, timeout: float = 4.0):
     r, _, _ = select.select([sock], [], [], timeout)
     if not r:
-        return None, None, None
+        return None, 0, None, None
 
     hdr = recv_exact(sock, 10)
     ver, cmd, seq, opcode, packed_len = struct.unpack(">BBHHI", hdr)
@@ -196,8 +196,37 @@ def recv_frame(sock: ssl.SSLSocket, timeout: float = 4.0):
     unpacker = msgpack.Unpacker(raw=False, strict_map_key=False)
     unpacker.feed(body[offset:])
     for obj in unpacker:
-        return cmd, opcode, obj
-    return cmd, opcode, {}
+        return cmd, seq, opcode, obj
+    return cmd, seq, opcode, {}
+
+
+def extract_chat_id(data: Dict[str, Any]) -> Optional[int]:
+    """Извлекает ID чата из входящего пакета или словаря сообщения."""
+    if not isinstance(data, dict):
+        return None
+    cid = data.get("chatId") or data.get("chat_id") or data.get("chat")
+    if cid is not None:
+        try:
+            return int(cid)
+        except (ValueError, TypeError):
+            pass
+
+    msg = data.get("message")
+    if isinstance(msg, dict):
+        cid = msg.get("chatId") or msg.get("chat_id") or msg.get("chat")
+        if cid is not None:
+            try:
+                return int(cid)
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
+def is_target_chat(chat_id: Optional[int], target_id: Optional[int]) -> bool:
+    """Проверяет, совпадает ли ID чата с целевым (с учетом возможного знака минус)."""
+    if target_id is None or chat_id is None:
+        return False
+    return chat_id == target_id or abs(chat_id) == abs(target_id)
 
 NAMES_FILE = BASE_DIR / "user_names.json"
 
@@ -230,7 +259,7 @@ def resolve_unknown_senders(sock: ssl.SSLSocket, sender_ids: Set[int]):
         return
     try:
         send_frame(sock, 10, 0, get_seq(), 32, {"contactIds": unknown})
-        cmd, op, data = recv_frame(sock, timeout=4.0)
+        cmd, seq, op, data = recv_frame(sock, timeout=4.0)
         if op == 32 and isinstance(data, dict):
             for c in data.get("contacts", []):
                 cid = c.get("id")
@@ -259,6 +288,16 @@ def parse_and_forward_message(msg: Dict[str, Any], seen_ids: Set[str], initial_w
     sender_id = msg.get("sender")
     attaches = msg.get("attaches") or []
 
+    # Поддержка пересланных сообщений (Forward)
+    fwd_msg = (msg.get("link") or {}).get("message")
+    if isinstance(fwd_msg, dict):
+        if not text and fwd_msg.get("text"):
+            text = fwd_msg.get("text")
+        if not attaches and fwd_msg.get("attaches"):
+            attaches = fwd_msg.get("attaches")
+        if not sender_id and fwd_msg.get("sender"):
+            sender_id = fwd_msg.get("sender")
+
     if not text and not attaches:
         seen_ids.add(msg_id)
         return
@@ -271,8 +310,9 @@ def parse_and_forward_message(msg: Dict[str, Any], seen_ids: Set[str], initial_w
     for att in attaches:
         att_type = att.get("_type") or att.get("type") or "файл"
         url = att.get("url") or (att.get("payload") or {}).get("url")
+        name = att.get("name") or att_type
         if url:
-            links.append(f"📎 <a href=\"{url}\">{att_type}</a>")
+            links.append(f"📎 <a href=\"{url}\">{html.escape(str(name))}</a>")
 
     header = f"💬 <b>[{SOURCE_CHAT_NAME}] {safe_author}</b>:\n{safe_text}"
     if links:
@@ -292,7 +332,13 @@ def run_userbot():
         return
 
     seen_ids = load_seen_ids()
-    target_chat_id = int(MAX_CHAT_ID)
+    try:
+        target_chat_id = int(MAX_CHAT_ID)
+    except (ValueError, TypeError):
+        logger.error("❌ MAX_CHAT_ID '%s' некорректен! Укажите числовой ID группы в .env", MAX_CHAT_ID)
+        return
+
+    chat_titles: Dict[int, str] = {target_chat_id: SOURCE_CHAT_NAME}
 
     logger.info("🚀 Запуск MAX Userbot...")
     logger.info("🎯 Отслеживаемый чат: %s (%s)", SOURCE_CHAT_NAME, target_chat_id)
@@ -323,16 +369,16 @@ def run_userbot():
                 },
                 "deviceId": MAX_DEVICE_ID
             })
-            cmd, op, _ = recv_frame(sock)
+            cmd, seq, op, _ = recv_frame(sock)
 
             # 2. LOGIN
             send_frame(sock, 10, 0, get_seq(), 19, {
                 "interactive": True,
                 "token": MAX_USER_TOKEN,
-                "chatsCount": 10,
-                "chatsSync": 10
+                "chatsCount": 20,
+                "chatsSync": 20
             })
-            cmd, op, login_data = recv_frame(sock)
+            cmd, seq, op, login_data = recv_frame(sock)
 
             if cmd == 3:
                 logger.error("❌ Ошибка авторизации токена! Возможно, сессия была завершена.")
@@ -353,10 +399,17 @@ def run_userbot():
                     USER_NAMES[uid] = names[0].get("name", f"User_{uid}")
             save_names()
 
+            # Сохраняем названия чатов для красивого логгирования
+            for c in login_data.get("chats", []):
+                cid = c.get("id")
+                title = c.get("title") or c.get("type")
+                if cid and title:
+                    chat_titles[cid] = title
+
             profile_name = USER_NAMES.get(my_id) or "Gengro"
             logger.info("✅ Успешный вход под аккаунтом: %s (ID: %s)", profile_name, my_id)
 
-            # Прогрев: запоминаем существующие сообщения
+            # Прогрев: запоминаем существующие сообщения только целевого чата
             now_ms = int(time.time() * 1000)
             send_frame(sock, 10, 0, get_seq(), 49, {
                 "chatId": target_chat_id,
@@ -365,7 +418,7 @@ def run_userbot():
                 "forward": 0,
                 "getMessages": True
             })
-            cmd, op, hist_data = recv_frame(sock, timeout=10.0)
+            cmd, seq, op, hist_data = recv_frame(sock, timeout=10.0)
             if hist_data and isinstance(hist_data, dict):
                 msgs = hist_data.get("messages", [])
                 unknown = {m.get("sender") for m in msgs if m.get("sender") and m.get("sender") not in USER_NAMES}
@@ -375,18 +428,18 @@ def run_userbot():
                     parse_and_forward_message(m, seen_ids, initial_warmup=first_run)
             first_run = False
             save_seen_ids(seen_ids)
-            logger.info("👀 Мониторинг группы активен! Ожидаем новых сообщений...")
+            logger.info("👀 Мониторинг группы '%s' активен! Ожидаем новых сообщений...", SOURCE_CHAT_NAME)
 
             last_ping = time.time()
 
             # Рабочий цикл прослушивания и периодического опроса
             while RUNNING:
-                # Отправка PING каждые 25 секунд
+                # Отправка клиентского PING каждые 25 секунд
                 if time.time() - last_ping > 25:
                     send_frame(sock, 10, 0, get_seq(), 1, {"interactive": True})
                     last_ping = time.time()
 
-                # Периодический опрос истории чата (раз в 3-4 секунды)
+                # Периодический опрос истории только целевого чата
                 now_ms = int(time.time() * 1000)
                 send_frame(sock, 10, 0, get_seq(), 49, {
                     "chatId": target_chat_id,
@@ -396,20 +449,48 @@ def run_userbot():
                     "getMessages": True
                 })
 
-                cmd, op, data = recv_frame(sock, timeout=3.0)
+                cmd, seq, op, data = recv_frame(sock, timeout=3.0)
                 if cmd is not None and isinstance(data, dict):
+                    # 1. Серверный PING (cmd == 0, op == 1) - подтверждаем
+                    if cmd == 0 and op == 1:
+                        send_frame(sock, 10, 1, seq, 1, {})
+                        continue
+
+                    # 2. Ответ на опрос истории сообщений (op == 49)
                     if op == 49:
+                        hist_cid = extract_chat_id(data)
+                        if hist_cid is not None and not is_target_chat(hist_cid, target_chat_id):
+                            continue
                         msgs = data.get("messages", [])
                         unknown = {m.get("sender") for m in msgs if m.get("sender") and m.get("sender") not in USER_NAMES}
                         if unknown:
                             resolve_unknown_senders(sock, unknown)
                         for m in reversed(msgs):
                             parse_and_forward_message(m, seen_ids, initial_warmup=False)
+
+                    # 3. Серверное push-уведомление о новом сообщении в реальном времени
                     elif "message" in data:
-                        sender = data["message"].get("sender")
+                        incoming_chat_id = extract_chat_id(data)
+                        msg_obj = data["message"]
+                        msg_id = msg_obj.get("id")
+
+                        # Подтверждаем серверу прием пакета (ACK)
+                        if cmd == 0 and op == 128 and incoming_chat_id and msg_id:
+                            send_frame(sock, 10, 1, seq, 128, {
+                                "chatId": incoming_chat_id,
+                                "messageId": msg_id
+                            })
+
+                        # СТРОГИЙ ФИЛЬТР: проверяем, что сообщение пришло именно из целевого чата!
+                        if not is_target_chat(incoming_chat_id, target_chat_id):
+                            chat_title = chat_titles.get(incoming_chat_id, f"ID {incoming_chat_id}")
+                            logger.info("⏭️ Пропуск сообщения из другого чата '%s' (не '%s')", chat_title, SOURCE_CHAT_NAME)
+                            continue
+
+                        sender = msg_obj.get("sender")
                         if sender and sender not in USER_NAMES:
                             resolve_unknown_senders(sock, {sender})
-                        parse_and_forward_message(data["message"], seen_ids, initial_warmup=False)
+                        parse_and_forward_message(msg_obj, seen_ids, initial_warmup=False)
 
                 time.sleep(1.0)
 
@@ -431,3 +512,4 @@ def run_userbot():
 
 if __name__ == "__main__":
     run_userbot()
+
