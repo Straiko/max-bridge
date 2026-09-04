@@ -121,7 +121,9 @@ def send_to_telegram(
     text: str,
     photo_url: Optional[str] = None,
     document_bytes: Optional[bytes] = None,
-    document_name: Optional[str] = None
+    document_name: Optional[str] = None,
+    video_url: Optional[str] = None,
+    video_bytes: Optional[bytes] = None
 ) -> bool:
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         logger.warning("Не настроен TG_BOT_TOKEN или TG_CHAT_ID! Перейдите в Telegram и укажите ID группы в .env")
@@ -138,14 +140,37 @@ def send_to_telegram(
             files = {
                 "document": (filename, document_bytes)
             }
-            r = requests.post(f"{TG_API_BASE}/sendDocument", data=payload, files=files, timeout=30)
+            r = requests.post(f"{TG_API_BASE}/sendDocument", data=payload, files=files, timeout=40)
             res = r.json()
             if r.status_code == 200 and res.get("ok"):
                 return True
             else:
                 logger.warning("Не удалось отправить документ с HTML: %s, повтор plain text", res.get("description"))
                 payload["parse_mode"] = ""
-                r2 = requests.post(f"{TG_API_BASE}/sendDocument", data=payload, files={"document": (filename, document_bytes)}, timeout=30)
+                r2 = requests.post(f"{TG_API_BASE}/sendDocument", data=payload, files={"document": (filename, document_bytes)}, timeout=40)
+                return bool(r2.status_code == 200 and r2.json().get("ok"))
+
+        elif video_bytes or video_url:
+            payload = {
+                "chat_id": TG_CHAT_ID,
+                "caption": text[:1024],
+                "parse_mode": "HTML"
+            }
+            if video_bytes:
+                files = {"video": ("video.mp4", video_bytes)}
+                r = requests.post(f"{TG_API_BASE}/sendVideo", data=payload, files=files, timeout=60)
+            else:
+                payload["video"] = video_url
+                r = requests.post(f"{TG_API_BASE}/sendVideo", json=payload, timeout=30)
+            res = r.json()
+            if r.status_code == 200 and res.get("ok"):
+                return True
+            else:
+                payload["parse_mode"] = ""
+                if video_bytes:
+                    r2 = requests.post(f"{TG_API_BASE}/sendVideo", data=payload, files={"video": ("video.mp4", video_bytes)}, timeout=60)
+                else:
+                    r2 = requests.post(f"{TG_API_BASE}/sendVideo", json=payload, timeout=30)
                 return bool(r2.status_code == 200 and r2.json().get("ok"))
 
         elif photo_url:
@@ -266,11 +291,30 @@ def extract_chat_id(data: Dict[str, Any]) -> Optional[int]:
     return None
 
 
-def is_target_chat(chat_id: Optional[int], target_id: Optional[int]) -> bool:
-    """Проверяет, совпадает ли ID чата с целевым (с учетом возможного знака минус)."""
-    if target_id is None or chat_id is None:
+def parse_target_chats(raw: str) -> List[int]:
+    """Разбирает список ID чатов из строки конфигурации (разделенных запятыми)."""
+    chats = []
+    for p in str(raw).split(","):
+        p = p.strip()
+        if p:
+            try:
+                chats.append(int(p))
+            except ValueError:
+                pass
+    return chats
+
+
+def is_target_chat(chat_id: Optional[int], target: Any) -> bool:
+    """Проверяет, совпадает ли ID чата с целевым или входит в список целевых чатов."""
+    if chat_id is None or target is None:
         return False
-    return chat_id == target_id or abs(chat_id) == abs(target_id)
+    if isinstance(target, (list, tuple, set)):
+        return any(chat_id == t or abs(chat_id) == abs(t) for t in target if t is not None)
+    try:
+        t_int = int(target)
+        return chat_id == t_int or abs(chat_id) == abs(t_int)
+    except (ValueError, TypeError):
+        return False
 
 NAMES_FILE = BASE_DIR / "user_names.json"
 
@@ -359,6 +403,39 @@ def request_file_url(sock: Optional[ssl.SSLSocket], file_id: int, chat_id: int, 
     return None
 
 
+def request_video_url(sock: Optional[ssl.SSLSocket], video_id: int, chat_id: int, message_id: int, token: str = "") -> Optional[str]:
+    """Запрашивает ссылку на видео через Opcode 83 (устойчиво к чередованию пакетов)."""
+    if not sock:
+        return None
+    try:
+        req_seq = get_seq()
+        send_frame(sock, 10, 0, req_seq, 83, {
+            "videoId": video_id,
+            "token": token or "",
+            "chatId": chat_id,
+            "messageId": message_id
+        })
+        start_t = time.time()
+        while time.time() - start_t < 6.0:
+            cmd, seq, op, data = recv_frame(sock, timeout=2.0)
+            if cmd is None:
+                continue
+            if cmd == 0 and op == 1:
+                send_frame(sock, 10, 1, seq, 1, {})
+                continue
+            if op == 83 and isinstance(data, dict):
+                for q in ["MP4_1080", "MP4_720", "MP4_480", "MP4_360", "url"]:
+                    if data.get(q):
+                        return data[q]
+                if "error" in data:
+                    logger.warning("Сервер MAX вернул ошибку видео %s: %s", video_id, data.get("error"))
+                    return None
+            PENDING_FRAMES.append((cmd, seq, op, data))
+    except Exception as e:
+        logger.error("Ошибка при запросе ссылки на видео %s: %s", video_id, e)
+    return None
+
+
 def download_file_bytes(url: str, max_size: int = 45 * 1024 * 1024) -> Optional[bytes]:
     """Скачивает файл по временной ссылке (с защитой по максимальному размеру 45MB)."""
     try:
@@ -381,7 +458,8 @@ def parse_and_forward_message(
     msg: Dict[str, Any],
     target_chat_id: int,
     seen_ids: Set[str],
-    initial_warmup: bool = False
+    initial_warmup: bool = False,
+    chat_title: Optional[str] = None
 ) -> None:
     msg_id = str(msg.get("id") or "")
     if not msg_id:
@@ -425,11 +503,12 @@ def parse_and_forward_message(
         seen_ids.add(msg_id)
         return
 
+    chat_name = chat_title or SOURCE_CHAT_NAME
     author_name = USER_NAMES.get(sender_id) or (f"Участник #{sender_id}" if sender_id else "Сообщение")
     safe_author = html.escape(str(author_name))
     safe_text = html.escape(str(text)) if text else ""
 
-    header = f"💬 <b>[{SOURCE_CHAT_NAME}] {safe_author}</b>"
+    header = f"💬 <b>[{chat_name}] {safe_author}</b>"
     if is_forward:
         if orig_author_name:
             header += f" <i>(переслано от {html.escape(orig_author_name)})</i>:"
@@ -443,21 +522,23 @@ def parse_and_forward_message(
     elif not attaches:
         header += "\n<i>(без текста)</i>"
 
-    # Обработка медиа и вложений (фото, файлы, документы)
+    # Обработка медиа и вложений (фото, файлы, видео)
     photo_url = None
     doc_bytes = None
     doc_name = None
+    video_url = None
+    video_bytes = None
     other_links = []
 
     for att in attaches:
         att_type = att.get("_type") or att.get("type") or ""
 
         # 1. Фотография (в MAX у фото есть baseUrl или url)
-        if (att_type == "PHOTO" or "baseUrl" in att or "photoId" in att) and not photo_url and not doc_bytes:
+        if (att_type == "PHOTO" or "baseUrl" in att or "photoId" in att) and not photo_url and not doc_bytes and not video_url and not video_bytes:
             photo_url = att.get("baseUrl") or att.get("url")
 
         # 2. Файл / Документ (например .xlsx, .pdf, .docx)
-        elif (att_type == "FILE" or "fileId" in att) and sock and not doc_bytes:
+        elif (att_type == "FILE" or "fileId" in att) and sock and not doc_bytes and not video_url and not video_bytes:
             file_id = att.get("fileId")
             file_name = att.get("name") or "файл"
             if file_id:
@@ -477,7 +558,26 @@ def parse_and_forward_message(
                 else:
                     other_links.append(f"📎 Файл: {html.escape(file_name)} (не удалось получить ссылку)")
 
-        # 3. Другие вложения / веб-ссылки
+        # 3. Видеофайл (VIDEO)
+        elif (att_type == "VIDEO" or "videoId" in att) and sock and not doc_bytes and not video_url and not video_bytes:
+            video_id = att.get("videoId")
+            v_token = att.get("token") or ""
+            if video_id:
+                v_url = request_video_url(sock, video_id, target_chat_id, int(msg_id), v_token)
+                if not v_url and fwd_chat_id and fwd_msg and fwd_msg.get("id"):
+                    v_url = request_video_url(sock, video_id, int(fwd_chat_id), int(fwd_msg["id"]), v_token)
+
+                if v_url:
+                    logger.info("🎬 Загрузка видео (ID: %s)...", video_id)
+                    b = download_file_bytes(v_url, max_size=48 * 1024 * 1024)
+                    if b:
+                        video_bytes = b
+                    else:
+                        video_url = v_url
+                else:
+                    other_links.append("🎬 Видео (не удалось получить ссылку)")
+
+        # 4. Другие вложения / веб-ссылки
         else:
             url = att.get("url") or (att.get("payload") or {}).get("url")
             name = att.get("name") or att_type or "вложение"
@@ -487,11 +587,15 @@ def parse_and_forward_message(
     if other_links:
         header += "\n" + "\n".join(other_links)
 
-    logger.info("📩 Новое сообщение от %s: %s (вложений: %d)", author_name, (text[:60] if text else doc_name or "фото/файл"), len(attaches))
+    logger.info("📩 Новое сообщение от %s: %s (вложений: %d)", author_name, (text[:60] if text else doc_name or "медиа"), len(attaches))
 
     sent = False
     if doc_bytes:
         sent = send_to_telegram(header, document_bytes=doc_bytes, document_name=doc_name)
+    elif video_bytes:
+        sent = send_to_telegram(header, video_bytes=video_bytes)
+    elif video_url:
+        sent = send_to_telegram(header, video_url=video_url)
     elif photo_url:
         sent = send_to_telegram(header, photo_url=photo_url)
     else:
@@ -510,16 +614,15 @@ def run_userbot():
         return
 
     seen_ids = load_seen_ids()
-    try:
-        target_chat_id = int(MAX_CHAT_ID)
-    except (ValueError, TypeError):
+    target_chats = parse_target_chats(MAX_CHAT_ID)
+    if not target_chats:
         logger.error("❌ MAX_CHAT_ID '%s' некорректен! Укажите числовой ID группы в .env", MAX_CHAT_ID)
         return
 
-    chat_titles: Dict[int, str] = {target_chat_id: SOURCE_CHAT_NAME}
+    chat_titles: Dict[int, str] = {cid: SOURCE_CHAT_NAME for cid in target_chats}
 
     logger.info("🚀 Запуск MAX Userbot...")
-    logger.info("🎯 Отслеживаемый чат: %s (%s)", SOURCE_CHAT_NAME, target_chat_id)
+    logger.info("🎯 Отслеживаемые чаты (%d): %s", len(target_chats), target_chats)
 
     # Если список seen_ids пуст, запоминаем текущие сообщения, чтобы не пересылать старую историю
     first_run = len(seen_ids) == 0
@@ -553,8 +656,8 @@ def run_userbot():
             send_frame(sock, 10, 0, get_seq(), 19, {
                 "interactive": True,
                 "token": MAX_USER_TOKEN,
-                "chatsCount": 20,
-                "chatsSync": 20
+                "chatsCount": 30,
+                "chatsSync": 30
             })
             cmd, seq, op, login_data = recv_frame(sock)
 
@@ -587,26 +690,28 @@ def run_userbot():
             profile_name = USER_NAMES.get(my_id) or "Gengro"
             logger.info("✅ Успешный вход под аккаунтом: %s (ID: %s)", profile_name, my_id)
 
-            # Прогрев: запоминаем существующие сообщения только целевого чата
-            now_ms = int(time.time() * 1000)
-            send_frame(sock, 10, 0, get_seq(), 49, {
-                "chatId": target_chat_id,
-                "from": now_ms,
-                "backward": 10,
-                "forward": 0,
-                "getMessages": True
-            })
-            cmd, seq, op, hist_data = recv_frame(sock, timeout=10.0)
-            if hist_data and isinstance(hist_data, dict):
-                msgs = hist_data.get("messages", [])
-                unknown = {m.get("sender") for m in msgs if m.get("sender") and m.get("sender") not in USER_NAMES}
-                if unknown:
-                    resolve_unknown_senders(sock, unknown)
-                for m in msgs:
-                    parse_and_forward_message(sock, m, target_chat_id, seen_ids, initial_warmup=first_run)
+            # Прогрев: запоминаем существующие сообщения целевых чатов
+            for tid in target_chats:
+                now_ms = int(time.time() * 1000)
+                send_frame(sock, 10, 0, get_seq(), 49, {
+                    "chatId": tid,
+                    "from": now_ms,
+                    "backward": 10,
+                    "forward": 0,
+                    "getMessages": True
+                })
+                cmd, seq, op, hist_data = recv_frame(sock, timeout=8.0)
+                if hist_data and isinstance(hist_data, dict):
+                    msgs = hist_data.get("messages", [])
+                    unknown = {m.get("sender") for m in msgs if m.get("sender") and m.get("sender") not in USER_NAMES}
+                    if unknown:
+                        resolve_unknown_senders(sock, unknown)
+                    for m in msgs:
+                        parse_and_forward_message(sock, m, tid, seen_ids, initial_warmup=first_run, chat_title=chat_titles.get(tid))
+
             first_run = False
             save_seen_ids(seen_ids)
-            logger.info("👀 Мониторинг группы '%s' активен! Ожидаем новых сообщений...", SOURCE_CHAT_NAME)
+            logger.info("👀 Мониторинг целевых чатов активен! Ожидаем новых сообщений...")
 
             last_ping = time.time()
             last_poll = 0.0
@@ -618,16 +723,17 @@ def run_userbot():
                     send_frame(sock, 10, 0, get_seq(), 1, {"interactive": True})
                     last_ping = time.time()
 
-                # Периодический опрос истории целевого чата раз в 8 секунд (в остальное время слушаем push в реальном времени)
+                # Периодический опрос истории целевых чатов раз в 8 секунд
                 if time.time() - last_poll > 8.0:
                     now_ms = int(time.time() * 1000)
-                    send_frame(sock, 10, 0, get_seq(), 49, {
-                        "chatId": target_chat_id,
-                        "from": now_ms,
-                        "backward": 5,
-                        "forward": 0,
-                        "getMessages": True
-                    })
+                    for tid in target_chats:
+                        send_frame(sock, 10, 0, get_seq(), 49, {
+                            "chatId": tid,
+                            "from": now_ms,
+                            "backward": 5,
+                            "forward": 0,
+                            "getMessages": True
+                        })
                     last_poll = time.time()
 
                 cmd, seq, op, data = fetch_frame(sock, timeout=2.5)
@@ -640,14 +746,15 @@ def run_userbot():
                     # 2. Ответ на опрос истории сообщений (op == 49)
                     if op == 49:
                         hist_cid = extract_chat_id(data)
-                        if hist_cid is not None and not is_target_chat(hist_cid, target_chat_id):
+                        if hist_cid is not None and not is_target_chat(hist_cid, target_chats):
                             continue
+                        effective_cid = hist_cid or target_chats[0]
                         msgs = data.get("messages", [])
                         unknown = {m.get("sender") for m in msgs if m.get("sender") and m.get("sender") not in USER_NAMES}
                         if unknown:
                             resolve_unknown_senders(sock, unknown)
                         for m in reversed(msgs):
-                            parse_and_forward_message(sock, m, target_chat_id, seen_ids, initial_warmup=False)
+                            parse_and_forward_message(sock, m, effective_cid, seen_ids, initial_warmup=False, chat_title=chat_titles.get(effective_cid))
 
                     # 3. Серверное push-уведомление о новом сообщении в реальном времени
                     elif "message" in data:
@@ -663,15 +770,15 @@ def run_userbot():
                             })
 
                         # СТРОГИЙ ФИЛЬТР: проверяем, что сообщение пришло именно из целевого чата!
-                        if not is_target_chat(incoming_chat_id, target_chat_id):
+                        if not is_target_chat(incoming_chat_id, target_chats):
                             chat_title = chat_titles.get(incoming_chat_id, f"ID {incoming_chat_id}")
-                            logger.info("⏭️ Пропуск сообщения из другого чата '%s' (не '%s')", chat_title, SOURCE_CHAT_NAME)
+                            logger.info("⏭️ Пропуск сообщения из нецелевого чата '%s'", chat_title)
                             continue
 
                         sender = msg_obj.get("sender")
                         if sender and sender not in USER_NAMES:
                             resolve_unknown_senders(sock, {sender})
-                        parse_and_forward_message(sock, msg_obj, target_chat_id, seen_ids, initial_warmup=False)
+                        parse_and_forward_message(sock, msg_obj, incoming_chat_id or target_chats[0], seen_ids, initial_warmup=False, chat_title=chat_titles.get(incoming_chat_id))
 
                 time.sleep(0.5)
 
