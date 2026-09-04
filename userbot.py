@@ -313,20 +313,45 @@ def resolve_unknown_senders(sock: ssl.SSLSocket, sender_ids: Set[int]):
         logger.debug("Ошибка получения имен контактов: %s", e)
 
 
+PENDING_FRAMES: List[Tuple[Optional[int], int, Optional[int], Any]] = []
+
+
+def fetch_frame(sock: ssl.SSLSocket, timeout: float = 3.0) -> Tuple[Optional[int], int, Optional[int], Any]:
+    """Извлекает пакет из очереди отложенных пакетов или считывает из сокета."""
+    if PENDING_FRAMES:
+        return PENDING_FRAMES.pop(0)
+    return recv_frame(sock, timeout=timeout)
+
+
 def request_file_url(sock: Optional[ssl.SSLSocket], file_id: int, chat_id: int, message_id: int) -> Optional[str]:
-    """Запрашивает временную ссылку на скачивание файла через Opcode 88."""
+    """Запрашивает временную ссылку на скачивание файла через Opcode 88 (устойчиво к чередованию пакетов)."""
     if not sock:
         return None
     try:
-        send_frame(sock, 10, 0, get_seq(), 88, {
+        req_seq = get_seq()
+        send_frame(sock, 10, 0, req_seq, 88, {
             "fileId": file_id,
             "chatId": chat_id,
             "messageId": message_id,
             "itemType": "REGULAR"
         })
-        cmd, seq, op, data = recv_frame(sock, timeout=5.0)
-        if op == 88 and isinstance(data, dict):
-            return data.get("url")
+        start_t = time.time()
+        while time.time() - start_t < 6.0:
+            cmd, seq, op, data = recv_frame(sock, timeout=2.0)
+            if cmd is None:
+                continue
+            # Серверный PING во время ожидания - подтверждаем
+            if cmd == 0 and op == 1:
+                send_frame(sock, 10, 1, seq, 1, {})
+                continue
+            if op == 88 and isinstance(data, dict):
+                if data.get("url"):
+                    return data.get("url")
+                if "error" in data:
+                    logger.warning("Сервер MAX вернул ошибку файла %s: %s", file_id, data.get("error"))
+                    return None
+            # Любые другие входящие события (op 49, op 128) сохраняем в очередь
+            PENDING_FRAMES.append((cmd, seq, op, data))
     except Exception as e:
         logger.error("Ошибка при запросе ссылки на файл %s: %s", file_id, e)
     return None
@@ -376,14 +401,18 @@ def parse_and_forward_message(
     is_forward = False
     fwd_msg = (msg.get("link") or {}).get("message")
     fwd_chat_id = (msg.get("link") or {}).get("chatId")
+    orig_author_name = None
     if isinstance(fwd_msg, dict):
         is_forward = True
         if not text and fwd_msg.get("text"):
             text = fwd_msg.get("text")
         if not attaches and fwd_msg.get("attaches"):
             attaches = fwd_msg.get("attaches")
-        if not sender_id and fwd_msg.get("sender"):
-            sender_id = fwd_msg.get("sender")
+        orig_sender_id = fwd_msg.get("sender")
+        if orig_sender_id:
+            if orig_sender_id not in USER_NAMES and sock:
+                resolve_unknown_senders(sock, {orig_sender_id})
+            orig_author_name = USER_NAMES.get(orig_sender_id)
 
     # Игнорируем сервисные события входа/выхода (CONTROL)
     if attaches and all(a.get("_type") == "CONTROL" for a in attaches) and not text:
@@ -398,9 +427,15 @@ def parse_and_forward_message(
     safe_author = html.escape(str(author_name))
     safe_text = html.escape(str(text)) if text else ""
 
-    header = f"💬 <b>[{SOURCE_CHAT_NAME}] {safe_author}</b>:"
+    header = f"💬 <b>[{SOURCE_CHAT_NAME}] {safe_author}</b>"
     if is_forward:
-        header += " <i>(пересланное сообщение)</i>"
+        if orig_author_name:
+            header += f" <i>(переслано от {html.escape(orig_author_name)})</i>:"
+        else:
+            header += " <i>(пересланное сообщение)</i>:"
+    else:
+        header += ":"
+
     if safe_text:
         header += f"\n{safe_text}"
     elif not attaches:
@@ -572,6 +607,7 @@ def run_userbot():
             logger.info("👀 Мониторинг группы '%s' активен! Ожидаем новых сообщений...", SOURCE_CHAT_NAME)
 
             last_ping = time.time()
+            last_poll = 0.0
 
             # Рабочий цикл прослушивания и периодического опроса
             while RUNNING:
@@ -580,17 +616,19 @@ def run_userbot():
                     send_frame(sock, 10, 0, get_seq(), 1, {"interactive": True})
                     last_ping = time.time()
 
-                # Периодический опрос истории только целевого чата
-                now_ms = int(time.time() * 1000)
-                send_frame(sock, 10, 0, get_seq(), 49, {
-                    "chatId": target_chat_id,
-                    "from": now_ms,
-                    "backward": 5,
-                    "forward": 0,
-                    "getMessages": True
-                })
+                # Периодический опрос истории целевого чата раз в 8 секунд (в остальное время слушаем push в реальном времени)
+                if time.time() - last_poll > 8.0:
+                    now_ms = int(time.time() * 1000)
+                    send_frame(sock, 10, 0, get_seq(), 49, {
+                        "chatId": target_chat_id,
+                        "from": now_ms,
+                        "backward": 5,
+                        "forward": 0,
+                        "getMessages": True
+                    })
+                    last_poll = time.time()
 
-                cmd, seq, op, data = recv_frame(sock, timeout=3.0)
+                cmd, seq, op, data = fetch_frame(sock, timeout=2.5)
                 if cmd is not None and isinstance(data, dict):
                     # 1. Серверный PING (cmd == 0, op == 1) - подтверждаем
                     if cmd == 0 and op == 1:
@@ -633,7 +671,7 @@ def run_userbot():
                             resolve_unknown_senders(sock, {sender})
                         parse_and_forward_message(sock, msg_obj, target_chat_id, seen_ids, initial_warmup=False)
 
-                time.sleep(1.0)
+                time.sleep(0.5)
 
         except (ConnectionResetError, BrokenPipeError, socket.error) as e:
             logger.warning("Обрыв соединения (%s). Переподключение через 5 секунд...", e)
