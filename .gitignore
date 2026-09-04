@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+userbot_seen.json
+user_names.json
+.vscode/
