@@ -67,6 +67,8 @@ MAX_CHAT_ID = os.getenv("MAX_CHAT_ID", "-72161178330527").strip()
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 SOURCE_CHAT_NAME = os.getenv("SOURCE_CHAT_NAME", "ИСиП-2-23").strip()
+TG_PIN_MESSAGES = os.getenv("TG_PIN_MESSAGES", "true").strip().lower() in ("true", "1", "yes")
+TG_PIN_SILENT = os.getenv("TG_PIN_SILENT", "true").strip().lower() in ("true", "1", "yes")
 
 TG_API_BASE = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 HOST = "api.oneme.ru"
@@ -117,6 +119,28 @@ def save_seen_ids(seen: Set[str]) -> None:
         logger.error("Ошибка сохранения seen_ids: %s", e)
 
 
+def pin_telegram_message(message_id: int) -> bool:
+    if not TG_BOT_TOKEN or not TG_CHAT_ID or not message_id:
+        return False
+    try:
+        payload = {
+            "chat_id": TG_CHAT_ID,
+            "message_id": message_id,
+            "disable_notification": TG_PIN_SILENT
+        }
+        r = requests.post(f"{TG_API_BASE}/pinChatMessage", json=payload, timeout=10)
+        res = r.json()
+        if r.status_code == 200 and res.get("ok"):
+            logger.info("📌 Сообщение %s успешно закреплено в Telegram", message_id)
+            return True
+        else:
+            logger.warning("Не удалось закрепить сообщение %s: %s", message_id, res.get("description"))
+            return False
+    except Exception as e:
+        logger.warning("Исключение при закреплении сообщения %s: %s", message_id, e)
+        return False
+
+
 def send_to_telegram(
     text: str,
     photo_url: Optional[str] = None,
@@ -129,6 +153,7 @@ def send_to_telegram(
         logger.warning("Не настроен TG_BOT_TOKEN или TG_CHAT_ID! Перейдите в Telegram и укажите ID группы в .env")
         return False
 
+    message_id = None
     try:
         if document_bytes:
             filename = document_name or "document"
@@ -143,12 +168,16 @@ def send_to_telegram(
             r = requests.post(f"{TG_API_BASE}/sendDocument", data=payload, files=files, timeout=40)
             res = r.json()
             if r.status_code == 200 and res.get("ok"):
-                return True
+                message_id = res.get("result", {}).get("message_id")
             else:
                 logger.warning("Не удалось отправить документ с HTML: %s, повтор plain text", res.get("description"))
                 payload["parse_mode"] = ""
                 r2 = requests.post(f"{TG_API_BASE}/sendDocument", data=payload, files={"document": (filename, document_bytes)}, timeout=40)
-                return bool(r2.status_code == 200 and r2.json().get("ok"))
+                res2 = r2.json()
+                if r2.status_code == 200 and res2.get("ok"):
+                    message_id = res2.get("result", {}).get("message_id")
+                else:
+                    return False
 
         elif video_bytes or video_url:
             payload = {
@@ -164,14 +193,18 @@ def send_to_telegram(
                 r = requests.post(f"{TG_API_BASE}/sendVideo", json=payload, timeout=30)
             res = r.json()
             if r.status_code == 200 and res.get("ok"):
-                return True
+                message_id = res.get("result", {}).get("message_id")
             else:
                 payload["parse_mode"] = ""
                 if video_bytes:
                     r2 = requests.post(f"{TG_API_BASE}/sendVideo", data=payload, files={"video": ("video.mp4", video_bytes)}, timeout=60)
                 else:
                     r2 = requests.post(f"{TG_API_BASE}/sendVideo", json=payload, timeout=30)
-                return bool(r2.status_code == 200 and r2.json().get("ok"))
+                res2 = r2.json()
+                if r2.status_code == 200 and res2.get("ok"):
+                    message_id = res2.get("result", {}).get("message_id")
+                else:
+                    return False
 
         elif photo_url:
             payload = {
@@ -183,12 +216,16 @@ def send_to_telegram(
             r = requests.post(f"{TG_API_BASE}/sendPhoto", json=payload, timeout=20)
             res = r.json()
             if r.status_code == 200 and res.get("ok"):
-                return True
+                message_id = res.get("result", {}).get("message_id")
             else:
                 logger.warning("Не удалось отправить фото с HTML: %s, повтор plain text", res.get("description"))
                 payload["parse_mode"] = ""
                 r2 = requests.post(f"{TG_API_BASE}/sendPhoto", json=payload, timeout=20)
-                return bool(r2.status_code == 200 and r2.json().get("ok"))
+                res2 = r2.json()
+                if r2.status_code == 200 and res2.get("ok"):
+                    message_id = res2.get("result", {}).get("message_id")
+                else:
+                    return False
 
         else:
             payload = {
@@ -200,11 +237,20 @@ def send_to_telegram(
             r = requests.post(f"{TG_API_BASE}/sendMessage", json=payload, timeout=12)
             res = r.json()
             if r.status_code == 200 and res.get("ok"):
-                return True
+                message_id = res.get("result", {}).get("message_id")
             else:
-                logger.error("Ошибка Telegram API: %s", res.get("description"))
-                requests.post(f"{TG_API_BASE}/sendMessage", json={"chat_id": TG_CHAT_ID, "text": text}, timeout=10)
-                return False
+                logger.error("Ошибка Telegram API: %s. Попытка отправки без HTML...", res.get("description"))
+                r2 = requests.post(f"{TG_API_BASE}/sendMessage", json={"chat_id": TG_CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=10)
+                res2 = r2.json()
+                if r2.status_code == 200 and res2.get("ok"):
+                    message_id = res2.get("result", {}).get("message_id")
+                else:
+                    return False
+
+        if TG_PIN_MESSAGES and message_id:
+            pin_telegram_message(message_id)
+
+        return True
     except Exception as e:
         logger.error("Исключение при отправке в Telegram: %s", e)
         return False

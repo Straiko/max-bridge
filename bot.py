@@ -70,6 +70,8 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 MAX_API_BASE = os.getenv("MAX_API_BASE", "https://platform-api2.max.ru").rstrip("/")
 SOURCE_CHAT_NAME = os.getenv("SOURCE_CHAT_NAME", "MAX").strip()
 VERIFY_SSL = os.getenv("MAX_VERIFY_SSL", "False").lower() in ("true", "1", "yes")
+TG_PIN_MESSAGES = os.getenv("TG_PIN_MESSAGES", "true").strip().lower() in ("true", "1", "yes")
+TG_PIN_SILENT = os.getenv("TG_PIN_SILENT", "true").strip().lower() in ("true", "1", "yes")
 
 TG_API_BASE = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
@@ -165,12 +167,36 @@ def check_tokens() -> bool:
     return success
 
 
+def pin_telegram_message(message_id: int) -> bool:
+    """Закрепляет отправленное сообщение в группе Telegram."""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID or not message_id:
+        return False
+    try:
+        payload = {
+            "chat_id": TG_CHAT_ID,
+            "message_id": message_id,
+            "disable_notification": TG_PIN_SILENT
+        }
+        r = requests.post(f"{TG_API_BASE}/pinChatMessage", json=payload, timeout=10)
+        res = r.json()
+        if r.status_code == 200 and res.get("ok"):
+            logger.info("📌 Сообщение %s успешно закреплено в Telegram", message_id)
+            return True
+        else:
+            logger.warning("Не удалось закрепить сообщение %s: %s", message_id, res.get("description"))
+            return False
+    except Exception as e:
+        logger.warning("Исключение при закреплении сообщения %s: %s", message_id, e)
+        return False
+
+
 def send_to_telegram(text: str, photo_url: Optional[str] = None, file_url: Optional[str] = None) -> bool:
     """Отправляет отформатированное сообщение в группу Telegram."""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         logger.warning("Невозможно отправить в Telegram: не настроен TG_BOT_TOKEN или TG_CHAT_ID")
         return False
 
+    message_id = None
     try:
         if photo_url:
             payload = {
@@ -199,14 +225,25 @@ def send_to_telegram(text: str, photo_url: Optional[str] = None, file_url: Optio
 
         data = r.json()
         if r.status_code == 200 and data.get("ok"):
-            return True
+            message_id = data.get("result", {}).get("message_id")
         else:
             logger.error("Ошибка отправки в Telegram: %s (код %d)", data.get("description"), r.status_code)
             # Если не удалось отправить с HTML форматированием (например, некорректный тег), шлем plain text
             if "can't parse entities" in data.get("description", "").lower():
                 payload["parse_mode"] = ""
-                requests.post(f"{TG_API_BASE}/sendMessage", json={"chat_id": TG_CHAT_ID, "text": text}, timeout=10)
-            return False
+                r2 = requests.post(f"{TG_API_BASE}/sendMessage", json={"chat_id": TG_CHAT_ID, "text": text}, timeout=10)
+                d2 = r2.json()
+                if r2.status_code == 200 and d2.get("ok"):
+                    message_id = d2.get("result", {}).get("message_id")
+                else:
+                    return False
+            else:
+                return False
+
+        if TG_PIN_MESSAGES and message_id:
+            pin_telegram_message(message_id)
+
+        return True
     except Exception as e:
         logger.error("Исключение при отправке в Telegram: %s", e)
         return False
